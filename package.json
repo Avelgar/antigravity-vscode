@@ -1,0 +1,49 @@
+{
+  "name": "antigravity-assistant",
+  "displayName": "Antigravity Assistant",
+  "description": "Автономный агент Gemini 3.8 Flash для VS Code",
+  "version": "1.0.0",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "antigravity-sidebar",
+          "title": "Antigravity",
+          "icon": "$(hubot)"
+        }
+      ]
+    },
+    "views": {
+      "antigravity-sidebar": [
+        {
+          "type": "webview",
+          "id": "antigravity.chatView",
+          "name": "Чат Antigravity"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.x",
+    "@types/vscode": "^1.90.0",
+    "@types/ws": "^8.18.2",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
