@@ -99,17 +99,22 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
 
             const text = response.text || "";
 
-            // 1. Синхронизация файлов [SYNC: ...]
-            if (response.files && Object.keys(response.files).length > 0) {
-                for (const [fname, b64Data] of Object.entries(response.files as Record<string, string>)) {
-                    const cleanFname = fname.replace(/\\/g, '/');
-                    const fullPath = path.join(rootDir, cleanFname);
-                    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-                    fs.writeFileSync(fullPath, Buffer.from(b64Data, 'base64'));
-                    this._postStatus(`💾 Сохранен: ${cleanFname}`);
+            // 1. Авто-скачивание файлов по HTTP ссылкам (без лимита на размер файла)
+            if (response.file_urls && Object.keys(response.file_urls).length > 0) {
+                for (const [relPath, fileUrl] of Object.entries(response.file_urls as Record<string, string>)) {
+                    this._postStatus(`📥 Скачивание: ${relPath}...`);
+                    try {
+                        const fileResp = await fetch(fileUrl);
+                        const arrayBuf = await fileResp.arrayBuffer();
+                        const fullPath = path.join(rootDir, relPath);
+                        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+                        fs.writeFileSync(fullPath, Buffer.from(arrayBuf));
+                        this._postStatus(`💾 Сохранен на диск: ${relPath}`);
+                    } catch (dlErr: any) {
+                        this._postStatus(`❌ Ошибка скачивания ${relPath}: ${dlErr.message}`);
+                    }
                 }
             }
-
             // 2. Выполнение команды в терминале [RUN_COMMAND: ...]
             const cmdMatch = text.match(/\[RUN_COMMAND:\s*(.*?)\]/);
             if (cmdMatch) {
