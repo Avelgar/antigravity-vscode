@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import { exec } from 'child_process';
 
 const SERVER_URL = "wss://friday-assistant.ru/ws";
+const UPLOAD_URL = "https://friday-assistant.ru/api/upload";
 const IGNORE_DIRS = new Set([".git", "build", ".gradle", "__pycache__", "venv", ".idea", "node_modules", "out"]);
 
 export function activate(context: vscode.ExtensionContext) {
@@ -26,7 +27,6 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.options = { enableScripts: true };
         webviewView.webview.html = this._getHtmlForWebview();
 
-        // Подключаем сокет и сразу запрашиваем список чатов из БД
         this._ensureSocket().then(() => {
             this._sendRaw({ type: "get_chats" });
         });
@@ -47,8 +47,29 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                 case 'delete_chat':
                     this._sendRaw({ type: "delete_chat", chat_uid: data.chat_uid });
                     break;
+                case 'select_file_dialog':
+                    const uris = await vscode.window.showOpenDialog({
+                        canSelectMany: true,
+                        openLabel: "Прикрепить к чату",
+                        filters: { "Все файлы": ["*"] }
+                    });
+                    if (uris && uris.length > 0) {
+                        for (const uri of uris) {
+                            const stat = await vscode.workspace.fs.stat(uri);
+                            const name = path.basename(uri.fsPath);
+                            this._view?.webview.postMessage({
+                                type: 'file_attached',
+                                file: {
+                                    name: name,
+                                    fsPath: uri.fsPath,
+                                    size: stat.size
+                                }
+                            });
+                        }
+                    }
+                    break;
                 case 'send_prompt':
-                    await this._handleUserPrompt(data.prompt, data.chatId);
+                    await this._handleUserPrompt(data.prompt, data.chatId, data.attachments || []);
                     break;
             }
         });
@@ -77,10 +98,54 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
         return treeLines.join("\n");
     }
 
-    private async _handleUserPrompt(prompt: string, chatId: string) {
-        const rootDir = this._getWorkspaceRoot();
-        let currentPrompt = prompt;
+    private async _uploadToStorage(chatId: string, filename: string, buffer: Buffer): Promise<string | null> {
+        try {
+            const b64Name = Buffer.from(filename, 'utf-8').toString('base64');
+            const resp = await fetch(UPLOAD_URL, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/octet-stream",
+                    "X-Filename": encodeURIComponent(filename),
+                    "X-Filename-B64": b64Name,
+                    "X-Chat-Uid": chatId
+                },
+                body: buffer
+            });
+            const json: any = await resp.json();
+            return json?.url || null;
+        } catch (e: any) {
+            this._postStatus(`Ошибка загрузки ${filename}: ${e.message}`);
+            return null;
+        }
+    }
 
+    private async _handleUserPrompt(prompt: string, chatId: string, attachments: any[]) {
+        const rootDir = this._getWorkspaceRoot();
+        let promptPrefix = "";
+
+        // Обработка прикрепленных файлов и скриншотов
+        if (attachments && attachments.length > 0) {
+            this._postStatus(`Загрузка вложений (${attachments.length} шт.)...`);
+            for (const att of attachments) {
+                if (att.type === 'screenshot') {
+                    const buf = Buffer.from(att.base64, 'base64');
+                    const url = await this._uploadToStorage(chatId, att.name, buf);
+                    if (url) {
+                        promptPrefix += `[Прикреплен скриншот: ${att.name}]\nСсылка: ${url}\nСкачай через: curl -sL "${url}" -o "${att.name}"\n\n`;
+                    }
+                } else if (att.type === 'file' && att.fsPath) {
+                    if (fs.existsSync(att.fsPath)) {
+                        const buf = fs.readFileSync(att.fsPath);
+                        const url = await this._uploadToStorage(chatId, att.name, buf);
+                        if (url) {
+                            promptPrefix += `[Прикреплен файл: ${att.name}]\nСсылка: ${url}\nСкачай через: curl -sL "${url}" -o "${att.name}"\n\n`;
+                        }
+                    }
+                }
+            }
+        }
+
+        let currentPrompt = promptPrefix ? (promptPrefix + prompt) : prompt;
         this._postStatus("Отправка в Antigravity...");
 
         while (true) {
@@ -99,7 +164,7 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
 
             const text = response.text || "";
 
-            // 1. Авто-скачивание файлов по HTTP ссылкам (без лимита на размер файла)
+            // 1. Авто-выкачка файлов по HTTP ссылкам
             if (response.file_urls && Object.keys(response.file_urls).length > 0) {
                 for (const [relPath, fileUrl] of Object.entries(response.file_urls as Record<string, string>)) {
                     this._postStatus(`📥 Скачивание: ${relPath}...`);
@@ -109,12 +174,13 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                         const fullPath = path.join(rootDir, relPath);
                         fs.mkdirSync(path.dirname(fullPath), { recursive: true });
                         fs.writeFileSync(fullPath, Buffer.from(arrayBuf));
-                        this._postStatus(`💾 Сохранен на диск: ${relPath}`);
+                        this._postStatus(`💾 Сохранен: ${relPath}`);
                     } catch (dlErr: any) {
                         this._postStatus(`❌ Ошибка скачивания ${relPath}: ${dlErr.message}`);
                     }
                 }
             }
+
             // 2. Выполнение команды в терминале [RUN_COMMAND: ...]
             const cmdMatch = text.match(/\[RUN_COMMAND:\s*(.*?)\]/);
             if (cmdMatch) {
@@ -141,7 +207,7 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                 continue;
             }
 
-            // 4. Запрос файлов [GET_FILES: ...] (Умная загрузка: Текст текстом, Бинарники через HTTP /api/upload)
+            // 4. Запрос файлов [GET_FILES: ...]
             const getFilesMatch = text.match(/\[GET_FILES:\s*([^\]]+)\]/);
             if (getFilesMatch) {
                 const rawFiles = getFilesMatch[1].split(",");
@@ -155,41 +221,21 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                         const ext = path.extname(cleanRf).toLowerCase();
                         const stats = fs.statSync(fullPath);
 
-                        // Если это легкий текстовый файл (код, конфиги) до 500 КБ — шлем текстом
                         if (['.py', '.js', '.ts', '.html', '.css', '.json', '.txt', '.md', '.kt', '.java'].includes(ext) && stats.size < 500 * 1024) {
                             const content = fs.readFileSync(fullPath, 'utf-8');
                             fileParts.push(`=== FILE: ${cleanRf} ===\n${content}\n`);
                             this._postStatus(`📖 Прочитан: ${cleanRf}`);
                         } else {
-                            // Бинарный или тяжелый файл (DOCX 13MB, PDF, APK, Картинка) — загружаем на HTTP-сервер!
-                            this._postStatus(`☁️ Загрузка ${cleanRf} (${Math.round(stats.size / 1024 / 1024)} МБ) на сервер...`);
-                            try {
-                                const fileBuffer = fs.readFileSync(fullPath);
-                                const uploadResp = await fetch("https://friday-assistant.ru/api/upload", {
-                                    method: "POST",
-                                    headers: {
-                                        "Content-Type": "application/octet-stream",
-                                        "X-Filename": encodeURIComponent(path.basename(cleanRf)),
-                                        "X-Chat-Uid": chatId
-                                    },
-                                    body: fileBuffer
-                                });
-
-                                const uploadData: any = await uploadResp.json();
-                                if (uploadData && uploadData.url) {
-                                    fileParts.push(
-                                        `=== FILE: ${cleanRf} ===\n` +
-                                        `Файл загружен на сервер и доступен по ссылке: ${uploadData.url}\n` +
-                                        `Скачай его в свое окружение Linux командой:\n` +
-                                        `curl -sL "${uploadData.url}" -o "${cleanRf}"\n` +
-                                        `После скачивания ты сможешь разобрать его локально через python-docx или другие библиотеки.\n`
-                                    );
-                                    this._postStatus(`✅ Загружен на сервер: ${cleanRf}`);
-                                } else {
-                                    fileParts.push(`=== FILE: ${cleanRf} ===\n[Ошибка загрузки на сервер]\n`);
-                                }
-                            } catch (upErr: any) {
-                                fileParts.push(`=== FILE: ${cleanRf} ===\n[Ошибка загрузки: ${upErr.message}]\n`);
+                            this._postStatus(`☁️ Загрузка ${cleanRf} (${Math.round(stats.size / 1024 / 1024)} МБ)...`);
+                            const fileBuffer = fs.readFileSync(fullPath);
+                            const url = await this._uploadToStorage(chatId, path.basename(cleanRf), fileBuffer);
+                            if (url) {
+                                fileParts.push(
+                                    `=== FILE: ${cleanRf} ===\nФайл загружен на сервер: ${url}\nСкачай через: curl -sL "${url}" -o "${cleanRf}"\n`
+                                );
+                                this._postStatus(`✅ Загружен: ${cleanRf}`);
+                            } else {
+                                fileParts.push(`=== FILE: ${cleanRf} ===\n[Ошибка загрузки на сервер]\n`);
                             }
                         }
                     } else {
@@ -231,7 +277,6 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                 try {
                     const decoded = Buffer.from(raw.toString(), 'base64').toString('utf-8');
                     const json = JSON.parse(decoded);
-                    // Прокидываем события синхронизации базы сразу в вебвью
                     if (['antigravity_chats_list', 'antigravity_chat_history', 'antigravity_chat_created', 'antigravity_chat_deleted'].includes(json.type)) {
                         this._view?.webview.postMessage(json);
                     }
@@ -290,17 +335,35 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
 <head>
 <meta charset="UTF-8">
 <style>
-  body { font-family: var(--vscode-font-family); padding: 10px; color: var(--vscode-foreground); background: var(--vscode-sideBar-background); display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+  * { box-sizing: border-box; }
+  body { font-family: var(--vscode-font-family); padding: 10px; color: var(--vscode-foreground); background: var(--vscode-sideBar-background); display: flex; flex-direction: column; height: 100vh; margin: 0; }
   .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 8px; margin-bottom: 8px; }
   select, button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 4px 8px; cursor: pointer; border-radius: 2px; }
   select { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); max-width: 140px; }
-  #chat-container { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 4px; }
-  .msg { padding: 8px; border-radius: 4px; font-size: 13px; line-height: 1.4; white-space: pre-wrap; word-break: break-word; }
-  .user { background: var(--vscode-button-secondaryBackground); align-self: flex-end; max-width: 85%; }
-  .agent { background: var(--vscode-editor-inactiveSelectionBackground); align-self: flex-start; max-width: 90%; }
-  .status { font-size: 11px; color: var(--vscode-descriptionForeground); font-style: italic; margin-top: 4px; }
+  #chat-container { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 4px; user-select: text !important; -webkit-user-select: text !important; }
+  
+  .msg-wrapper { display: flex; flex-direction: column; max-width: 90%; }
+  .msg-wrapper.user { align-self: flex-end; }
+  .msg-wrapper.agent { align-self: flex-start; }
+  
+  .msg { padding: 8px 10px; border-radius: 4px; font-size: 13px; line-height: 1.4; white-space: pre-wrap; word-break: break-word; user-select: text !important; -webkit-user-select: text !important; cursor: text; }
+  .user .msg { background: var(--vscode-button-secondaryBackground); }
+  .agent .msg { background: var(--vscode-editor-inactiveSelectionBackground); }
+  
+  .msg-footer { display: flex; justify-content: flex-end; margin-top: 2px; }
+  .copy-btn { background: transparent; border: none; color: var(--vscode-descriptionForeground); font-size: 11px; cursor: pointer; padding: 2px 4px; border-radius: 2px; }
+  .copy-btn:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+
+  .status { font-size: 11px; color: var(--vscode-descriptionForeground); font-style: italic; margin-top: 4px; min-height: 16px; }
+  
+  /* Контейнер прикрепленных файлов и скриншотов */
+  #attachments-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .attachment-chip { display: flex; align-items: center; gap: 4px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); padding: 2px 6px; border-radius: 3px; font-size: 11px; }
+  .attachment-chip img { max-height: 24px; border-radius: 2px; }
+  .attachment-chip .remove-btn { cursor: pointer; font-weight: bold; margin-left: 2px; color: var(--vscode-errorForeground); }
+
   .input-area { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
-  textarea { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); resize: none; height: 60px; padding: 6px; font-family: inherit; }
+  textarea { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); resize: none; height: 65px; padding: 6px; font-family: inherit; font-size: 13px; }
   .btn-row { display: flex; gap: 6px; justify-content: flex-end; }
 </style>
 </head>
@@ -317,8 +380,10 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
   <div id="status-bar" class="status"></div>
 
   <div class="input-area">
-    <textarea id="prompt-input" placeholder="Задача или вопрос... (Ctrl+Enter)"></textarea>
+    <div id="attachments-bar"></div>
+    <textarea id="prompt-input" placeholder="Задача или вопрос... (Ctrl+V скриншот, Ctrl+Enter отправка)"></textarea>
     <div class="btn-row">
+      <button id="attach-file-btn">📎 Файл</button>
       <button id="send-btn">Отправить</button>
     </div>
   </div>
@@ -327,8 +392,95 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
   const vscode = acquireVsCodeApi();
   let currentChats = [];
   let activeChatUid = null;
+  let currentAttachments = [];
 
-  // При старте запрашиваем чаты из базы на сервере
+  // =========================================================================
+  // ЖЕЛЕЗНЫЙ ФИКС CTRL+C И СИСТЕМНОГО COPY
+  // =========================================================================
+  window.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C' || e.keyCode === 67)) {
+      const sel = window.getSelection();
+      if (sel && sel.toString().trim().length > 0) {
+        // Если текст выделен, глушим перехват фокуса на поле ввода!
+        e.stopPropagation();
+        navigator.clipboard.writeText(sel.toString());
+      }
+    }
+  }, true);
+
+  document.addEventListener('copy', (e) => {
+    const sel = window.getSelection();
+    if (sel && sel.toString().trim().length > 0) {
+      e.clipboardData.setData('text/plain', sel.toString());
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  });
+
+  // =========================================================================
+  // ВСТАВКА СКРИНШОТОВ ИЗ БУФЕРА ОБМЕНА (Ctrl+V)
+  // =========================================================================
+  document.addEventListener('paste', (e) => {
+    const items = (e.clipboardData || window.clipboardData)?.items;
+    if (!items) return;
+
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf('image') !== -1) {
+        e.preventDefault();
+        e.stopPropagation();
+        const blob = items[i].getAsFile();
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          const dataUrl = event.target.result;
+          const base64 = dataUrl.split(',')[1];
+          const name = 'screenshot_' + Date.now() + '.png';
+          currentAttachments.push({
+            type: 'screenshot',
+            name: name,
+            dataUrl: dataUrl,
+            base64: base64
+          });
+          renderAttachments();
+        };
+        reader.readAsDataURL(blob);
+      }
+    }
+  });
+
+  function renderAttachments() {
+    const bar = document.getElementById('attachments-bar');
+    bar.innerHTML = '';
+    currentAttachments.forEach((att, idx) => {
+      const chip = document.createElement('div');
+      chip.className = 'attachment-chip';
+      if (att.type === 'screenshot') {
+        chip.innerHTML = '<img src="' + att.dataUrl + '"> <span>' + att.name + '</span>';
+      } else {
+        const sizeStr = att.size ? ' (' + Math.round(att.size / 1024) + ' КБ)' : '';
+        chip.innerHTML = '<span>📄 ' + att.name + sizeStr + '</span>';
+      }
+      const removeBtn = document.createElement('span');
+      removeBtn.className = 'remove-btn';
+      removeBtn.textContent = '✖';
+      removeBtn.onclick = () => {
+        currentAttachments.splice(idx, 1);
+        renderAttachments();
+      };
+      chip.appendChild(removeBtn);
+      bar.appendChild(chip);
+    });
+  }
+
+  // =========================================================================
+  // ВЫБОР ФАЙЛА ЧЕРЕЗ СИСТЕМНЫЙ ДИАЛОГ (📎 Файл)
+  // =========================================================================
+  document.getElementById('attach-file-btn').onclick = () => {
+    vscode.postMessage({ type: 'select_file_dialog' });
+  };
+
+  // =========================================================================
+  // ЧАТЫ И СООБЩЕНИЯ
+  // =========================================================================
   vscode.postMessage({ type: 'get_chats' });
 
   function renderSelect() {
@@ -343,16 +495,43 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  function copyText(btn, text) {
+    navigator.clipboard.writeText(text).then(() => {
+      const old = btn.textContent;
+      btn.textContent = '✓ Скопировано';
+      setTimeout(() => { btn.textContent = old; }, 2000);
+    });
+  }
+
+  function appendMessageUI(role, text) {
+    const container = document.getElementById('chat-container');
+    const wrapper = document.createElement('div');
+    wrapper.className = 'msg-wrapper ' + role;
+
+    const div = document.createElement('div');
+    div.className = 'msg';
+    div.textContent = text;
+    wrapper.appendChild(div);
+
+    if (role === 'agent') {
+      const footer = document.createElement('div');
+      footer.className = 'msg-footer';
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'copy-btn';
+      copyBtn.textContent = '📋 Копировать';
+      copyBtn.onclick = () => copyText(copyBtn, text);
+      footer.appendChild(copyBtn);
+      wrapper.appendChild(footer);
+    }
+
+    container.appendChild(wrapper);
+    container.scrollTop = container.scrollHeight;
+  }
+
   function renderMessages(messages) {
     const container = document.getElementById('chat-container');
     container.innerHTML = '';
-    messages.forEach(m => {
-      const div = document.createElement('div');
-      div.className = 'msg ' + (m.role === 'user' ? 'user' : 'agent');
-      div.textContent = m.text;
-      container.appendChild(div);
-    });
-    container.scrollTop = container.scrollHeight;
+    messages.forEach(m => appendMessageUI(m.role, m.text));
   }
 
   document.getElementById('chat-select').onchange = (e) => {
@@ -373,21 +552,25 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
   function send() {
     const input = document.getElementById('prompt-input');
     const text = input.value.trim();
-    if (!text || !activeChatUid) return;
+    if ((!text && currentAttachments.length === 0) || !activeChatUid) return;
 
-    // Сразу рисуем локально сообщение пользователя
-    const container = document.getElementById('chat-container');
-    const div = document.createElement('div');
-    div.className = 'msg user';
-    div.textContent = text;
-    container.appendChild(div);
-    container.scrollTop = container.scrollHeight;
+    let displayMsg = text;
+    if (currentAttachments.length > 0) {
+      displayMsg = (displayMsg ? displayMsg + '\\n\\n' : '') + '[Вложения: ' + currentAttachments.map(a => a.name).join(', ') + ']';
+    }
+
+    appendMessageUI('user', displayMsg);
     input.value = '';
+
+    const payloadAttachments = [...currentAttachments];
+    currentAttachments = [];
+    renderAttachments();
 
     vscode.postMessage({
       type: 'send_prompt',
-      prompt: text,
-      chatId: activeChatUid
+      prompt: text || 'Посмотри прикрепленные вложения.',
+      chatId: activeChatUid,
+      attachments: payloadAttachments
     });
   }
 
@@ -402,11 +585,18 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
   window.addEventListener('message', (event) => {
     const msg = event.data;
 
-    // 1. Прилетел список чатов из БД
-    if (msg.type === 'antigravity_chats_list') {
+    if (msg.type === 'file_attached') {
+      currentAttachments.push({
+        type: 'file',
+        name: msg.file.name,
+        fsPath: msg.file.fsPath,
+        size: msg.file.size
+      });
+      renderAttachments();
+    }
+    else if (msg.type === 'antigravity_chats_list') {
       currentChats = msg.chats;
       if (currentChats.length === 0) {
-        // Если в базе вообще пусто — создаем первый диалог
         const initialUid = 'chat_' + Date.now();
         vscode.postMessage({ type: 'create_chat', chat_uid: initialUid, title: 'Новый диалог' });
         return;
@@ -415,23 +605,17 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
       renderSelect();
       vscode.postMessage({ type: 'get_chat_history', chat_uid: activeChatUid });
     }
-
-    // 2. Прилетела история сообщений конкретного чата из БД
     else if (msg.type === 'antigravity_chat_history') {
       if (msg.chat_uid === activeChatUid) {
         renderMessages(msg.messages);
       }
     }
-
-    // 3. Создан новый чат в БД
     else if (msg.type === 'antigravity_chat_created') {
       currentChats.unshift(msg.chat);
       activeChatUid = msg.chat.chat_uid;
       renderSelect();
       renderMessages([]);
     }
-
-    // 4. Чат удален из БД
     else if (msg.type === 'antigravity_chat_deleted') {
       currentChats = currentChats.filter(c => c.chat_uid !== msg.chat_uid);
       if (currentChats.length === 0) {
@@ -442,24 +626,14 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
         vscode.postMessage({ type: 'get_chat_history', chat_uid: activeChatUid });
       }
     }
-
-    // 5. Статусы выполнения
     else if (msg.type === 'status_update') {
       document.getElementById('status-bar').textContent = msg.status;
     }
-
-    // 6. Ответ агента
     else if (msg.type === 'agent_response') {
       document.getElementById('status-bar').textContent = '';
       if (msg.chatId === activeChatUid) {
-        const container = document.getElementById('chat-container');
-        const div = document.createElement('div');
-        div.className = 'msg agent';
-        div.textContent = msg.text;
-        container.appendChild(div);
-        container.scrollTop = container.scrollHeight;
+        appendMessageUI('agent', msg.text);
       }
-      // Обновляем список чатов, чтобы подтянулся сгенерированный заголовок
       vscode.postMessage({ type: 'get_chats' });
     }
   });
