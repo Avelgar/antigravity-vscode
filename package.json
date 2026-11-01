@@ -13,6 +13,22 @@
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
+    "commands": [
+      {
+        "command": "antigravity.openFullChat",
+        "title": "Antigravity: Открыть чат на весь экран",
+        "icon": "$(screen-full)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "antigravity.openFullChat",
+          "when": "view == antigravity.chatView",
+          "group": "navigation"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {
