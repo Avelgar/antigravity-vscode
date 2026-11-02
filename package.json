@@ -3,6 +3,7 @@
   "displayName": "Antigravity Assistant",
   "description": "Автономный агент Gemini 3.8 Flash для VS Code",
   "version": "1.0.0",
+  "publisher": "kirill",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -50,14 +51,16 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "compile": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --external:bufferutil --external:utf-8-validate --format=cjs --platform=node",
+    "watch": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --external:bufferutil --external:utf-8-validate --format=cjs --platform=node --watch",
+    "update": "npm run compile && npx @vscode/vsce package --allow-missing-repository --skip-license && code --install-extension antigravity-assistant-1.0.0.vsix --force"
   },
   "devDependencies": {
     "@types/katex": "^0.16.8",
     "@types/node": "^20.x",
     "@types/vscode": "^1.90.0",
     "@types/ws": "^8.18.2",
+    "esbuild": "^0.24.0",
     "typescript": "^5.4.0"
   },
   "dependencies": {
