@@ -437,10 +437,11 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                 break;
             }
             if (!response) {
-                this._postStatus("Сервер не ответил или соединение разорвано.");
+                this._postStatus("Сервер не ответил или вернул ошибку.");
+                // РАЗБЛОКИРУЕМ UI В ЧАТЕ!
+                this._postToAll({ type: 'antigravity_error', error: "Сбой запроса к AI. Проверьте логи сервера." });
                 break;
             }
-
             const text = response.text || "";
 
             // Если агент сгенерировал файлы, сохраняем ссылки и уведомляем пользователя о доступной синхронизации
@@ -1262,6 +1263,11 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
         appendMessageUI('agent', msg.html, true, msg.rawText);
       }
       vscode.postMessage({ type: 'get_chats' });
+    }
+    else if (msg.type === 'antigravity_error') {
+      stopTimer();
+      document.getElementById('status-bar').textContent = msg.error || 'Ошибка';
+      appendMessageUI('agent', '❌ Ошибка выполнения задачи: ' + (msg.error || 'Сервер не ответил'));
     }
   });
 </script>
