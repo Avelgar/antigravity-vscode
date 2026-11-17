@@ -130,12 +130,10 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
 
     constructor(private readonly _context: vscode.ExtensionContext) {}
 
-    // Текущая открытая папка в окне VS Code на любом устройстве
     private _getCurrentWorkspace(): string {
         return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || "";
     }
 
-    // Хранилище уже скачанных ссылок файлов (хранится в workspaceState и не сбрасывается при перезапуске)
     private _getDownloadedMap(): Record<string, string> {
         return this._context.workspaceState.get<Record<string, string>>('antigravity_synced_map') || {};
     }
@@ -214,6 +212,7 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'cancel_task':
                     this._isCancelled = true;
+                    this._isBusy = false;
                     this._sendRaw({ type: "cancel_task", chat_id: data.chatId, ui_msg_id: this._activeUiMsgId });
                     if (this._activeTaskCleanup) {
                         this._activeTaskCleanup();
@@ -246,14 +245,35 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                         filters: { "Все файлы": ["*"] }
                     });
                     if (uris && uris.length > 0) {
+                        const fileList: any[] = [];
                         for (const uri of uris) {
                             const stat = await vscode.workspace.fs.stat(uri);
                             const name = path.basename(uri.fsPath);
-                            this._postToAll({
-                                type: 'file_attached',
-                                file: { name, fsPath: uri.fsPath, size: stat.size }
+                            const ext = path.extname(name).toLowerCase();
+                            const isImg = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'].includes(ext);
+                            
+                            let base64: string | undefined = undefined;
+                            let dataUrl: string | undefined = undefined;
+                            if (isImg && stat.size < 12 * 1024 * 1024) {
+                                const bytes = await vscode.workspace.fs.readFile(uri);
+                                base64 = Buffer.from(bytes).toString('base64');
+                                const mime = ext === '.png' ? 'image/png' : (ext === '.webp' ? 'image/webp' : 'image/jpeg');
+                                dataUrl = `data:${mime};base64,${base64}`;
+                            }
+
+                            fileList.push({
+                                type: isImg ? 'screenshot' : 'file',
+                                name: name,
+                                fsPath: uri.fsPath,
+                                size: stat.size,
+                                base64: base64,
+                                dataUrl: dataUrl
                             });
                         }
+                        this._postToAll({
+                            type: 'files_attached_batch',
+                            files: fileList
+                        });
                     }
                     break;
                 case 'send_prompt':
@@ -264,9 +284,6 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    // Проверка наличия несинхронизированных файлов:
-    // Файл считается несинхронизированным, ТОЛЬКО если его физически нет на диске
-    // ИЛИ на сервере лежит более новая версия (другой URL), которую мы еще не скачивали.
     private _checkAndNotifyUnsynced(chatId: string) {
         const currentTarget = this._getCurrentWorkspace();
         const allFiles = this._chatFiles.get(chatId) || {};
@@ -278,7 +295,6 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
             const isAlreadyDownloaded = downloadedMap[normRel] === fileUrl;
 
             if (!currentTarget) {
-                // Если папка в VS Code не открыта, показываем доступные файлы
                 if (!isAlreadyDownloaded) { unsyncedCount++; }
                 continue;
             }
@@ -287,10 +303,8 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
             const existsLocally = fs.existsSync(fullPath);
 
             if (!existsLocally) {
-                // Файла физически нет на диске в текущей открытой папке
                 unsyncedCount++;
             } else if (!isAlreadyDownloaded) {
-                // Файл есть, но это старая версия (URL на сервере изменился)
                 unsyncedCount++;
             }
         }
@@ -302,7 +316,7 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    // Ручная синхронизация по кнопке (как git pull)
+    // Ручная синхронизация по кнопке (скачивает только новые или обновлённые файлы)
     private async _handleManualSync(chatId: string) {
         const targetDir = this._getCurrentWorkspace();
         if (!targetDir) {
@@ -311,16 +325,27 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
         }
 
         const allFiles = this._chatFiles.get(chatId) || {};
-        const count = Object.keys(allFiles).length;
-        if (count === 0) {
-            vscode.window.showInformationMessage("В этом диалоге нет файлов для синхронизации.");
+        const downloadedMap = this._getDownloadedMap();
+
+        // Берём ТОЛЬКО те файлы, которых нет на диске или у которых обновилась версия на сервере
+        const filesToSync = Object.entries(allFiles).filter(([relPath, fileUrl]) => {
+            const normRel = relPath.replace(/\\/g, '/');
+            const fullPath = path.join(targetDir, normRel);
+            const existsLocally = fs.existsSync(fullPath);
+            const isAlreadyDownloaded = downloadedMap[normRel] === fileUrl;
+            return !existsLocally || !isAlreadyDownloaded;
+        });
+
+        if (filesToSync.length === 0) {
+            vscode.window.showInformationMessage("Все файлы из этого диалога уже синхронизированы.");
+            this._checkAndNotifyUnsynced(chatId);
             return;
         }
 
-        this._postStatus(`Синхронизация файлов в '${path.basename(targetDir)}'...`);
+        this._postStatus(`Синхронизация ${filesToSync.length} новых файлов в '${path.basename(targetDir)}'...`);
 
         let syncedNow = 0;
-        for (const [relPath, fileUrl] of Object.entries(allFiles)) {
+        for (const [relPath, fileUrl] of filesToSync) {
             try {
                 const normRel = relPath.replace(/\\/g, '/');
                 this._postStatus(`📥 Скачивание: ${normRel}...`);
@@ -394,186 +419,179 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
         this._isBusy = true;
         try {
             const targetDir = this._getCurrentWorkspace() || ".";
-        let promptPrefix = "";
+            let promptPrefix = "";
 
-        if (attachments && attachments.length > 0) {
-            this._postStatus(`Загрузка вложений (${attachments.length} шт.)...`);
-            for (const att of attachments) {
-                if (att.type === 'screenshot') {
-                    const buf = Buffer.from(att.base64, 'base64');
-                    const url = await this._uploadToStorage(chatId, att.name, buf);
-                    if (url) {
-                        promptPrefix += `[Прикреплен скриншот: ${att.name}]\nСсылка: ${url}\nСкачай через: curl -sL "${url}" -o "${att.name}"\n\n`;
-                    }
-                } else if (att.type === 'file' && att.fsPath) {
-                    if (fs.existsSync(att.fsPath)) {
-                        const buf = fs.readFileSync(att.fsPath);
+            if (attachments && attachments.length > 0) {
+                this._postStatus(`Загрузка вложений (${attachments.length} шт.)...`);
+                for (const att of attachments) {
+                    if (att.type === 'screenshot' && att.base64) {
+                        const buf = Buffer.from(att.base64, 'base64');
                         const url = await this._uploadToStorage(chatId, att.name, buf);
                         if (url) {
-                            promptPrefix += `[Прикреплен файл: ${att.name}]\nСсылка: ${url}\nСкачай через: curl -sL "${url}" -o "${att.name}"\n\n`;
+                            promptPrefix += `[Прикреплен скриншот: ${att.name}]\nСсылка: ${url}\nСкачай через: curl -sL "${url}" -o "${att.name}"\n\n`;
                         }
-                    }
-                }
-            }
-        }
-
-        let currentPrompt = promptPrefix ? (promptPrefix + prompt) : prompt;
-        this._postStatus("Агент приступил к работе...");
-
-        while (!this._isCancelled) {
-            const task = {
-                type: "antigravity_task",
-                prompt: currentPrompt,
-                chat_id: chatId,
-                user_token: userAccount.user_token,
-                workspace_path: targetDir,
-                ui_msg_id: `vscode_${Date.now()}`
-            };
-
-            const response = await this._sendTask(task);
-            if (this._isCancelled || response?.type === 'antigravity_cancelled') {
-                this._postActivity("⏹ Задача прервана пользователем");
-                this._postToAll({ type: 'antigravity_cancelled', chatId: chatId });
-                break;
-            }
-            if (!response) {
-                this._postStatus("Сервер не ответил или вернул ошибку.");
-                // РАЗБЛОКИРУЕМ UI В ЧАТЕ!
-                this._postToAll({ type: 'antigravity_error', error: "Сбой запроса к AI. Проверьте логи сервера." });
-                break;
-            }
-            const text = response.text || "";
-
-            // Если агент сгенерировал файлы, сохраняем ссылки и уведомляем пользователя о доступной синхронизации
-            if (response.file_urls && Object.keys(response.file_urls).length > 0) {
-                const existing = this._chatFiles.get(chatId) || {};
-                const merged = { ...existing, ...response.file_urls };
-                this._chatFiles.set(chatId, merged);
-
-                // Очищаем статус "уже скачано" для тех файлов, которые агент только что обновил!
-                const downloadedMap = this._getDownloadedMap();
-                for (const rel of Object.keys(response.file_urls)) {
-                    delete downloadedMap[rel.replace(/\\/g, '/')];
-                }
-                this._context.workspaceState.update('antigravity_synced_map', downloadedMap);
-
-                this._checkAndNotifyUnsynced(chatId);
-            }
-
-            // Анализируем только исполняемый текст вне блоков кода
-            const actionable = getActionableText(text);
-
-            // [DELETE: ...]
-            const deleteMatches = Array.from(actionable.matchAll(/\[DELETE:\s*([^\]]+)\]/g));
-            if (deleteMatches.length > 0 && targetDir && targetDir !== ".") {
-                for (const match of deleteMatches) {
-                    const relPath = match[1].trim().replace(/\\/g, '/');
-                    const safeRel = path.normalize(relPath).replace(/^(\.\.[\/\\])+/, '');
-                    const fullPath = path.join(targetDir, safeRel);
-
-                    if (fullPath.startsWith(targetDir) && fs.existsSync(fullPath)) {
-                        try {
-                            fs.rmSync(fullPath, { recursive: true, force: true });
-                            this._postActivity(`🗑️ Удален файл проекта: \`${safeRel}\``);
-                        } catch (delErr: any) {
-                            this._postActivity(`⚠️ Ошибка удаления \`${safeRel}\`: ${delErr.message}`);
-                        }
-                    }
-                }
-            }
-
-            // [RUN_COMMAND: ...]
-            const cmdMatch = actionable.match(/\[RUN_COMMAND:\s*(.*?)\]/);
-            if (cmdMatch) {
-                const cmd = cmdMatch[1].trim().replace(/^python3\s+/, "python ");
-
-                // Защита от зависания при запуске интерактивных оболочек без аргументов
-                if (/^(cmd|powershell|bash|sh|python|node)(\.exe)?\s*$/i.test(cmd)) {
-                    currentPrompt = `Ошибка: Интерактивный запуск '${cmd}' не поддерживается в неинтерактивном режиме. Передавайте конкретную команду с аргументами.`;
-                    this._postActivity(`⚠️ Заблокирован интерактивный запуск: \`${cmd}\``);
-                    continue;
-                }
-
-                this._postActivity(`💻 Терминал в '${path.basename(targetDir)}': \`${cmd}\``);
-                this._postStatus(`⚙️ Выполняется: ${cmd.length > 55 ? cmd.slice(0, 52) + '...' : cmd}`);
-
-                const finalCmd = process.platform === 'win32' ? `chcp 65001 >nul && ${cmd}` : cmd;
-
-                const output = await new Promise<string>((resolve) => {
-                    exec(finalCmd, { cwd: targetDir, timeout: 120000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
-                        const code = error ? error.code || 1 : 0;
-                        const out = (stdout || "") + "\n" + (stderr || "");
-                        resolve(`Команда \`${cmd}\` завершена (код ${code}).\nЛоги:\n${out.slice(0, 3000)}`);
-                    });
-                });
-
-                this._postStatus("🧠 Агент анализирует логи терминала...");
-                currentPrompt = output;
-                continue;
-            }
-
-            // [GET_TREE]
-            if (actionable.includes("[GET_TREE]")) {
-                this._postActivity(`📁 Запрошена структура '${path.basename(targetDir)}' -> передано`);
-                const tree = this._scanTree(targetDir);
-                currentPrompt = `Вот структура проекта:\n${tree}`;
-                continue;
-            }
-
-            // [GET_FILES: ...]
-            const getFilesMatch = actionable.match(/\[GET_FILES:\s*([^\]]+)\]/);
-            if (getFilesMatch) {
-                const rawFiles = getFilesMatch[1].split(",");
-                const fileParts: string[] = [];
-
-                for (const rf of rawFiles) {
-                    const cleanRf = rf.trim().replace(/\\/g, '/');
-                    const fullPath = path.join(targetDir, cleanRf);
-
-                    if (fs.existsSync(fullPath)) {
-                        const ext = path.extname(cleanRf).toLowerCase();
-                        const stats = fs.statSync(fullPath);
-
-                        if (['.py', '.js', '.ts', '.html', '.css', '.json', '.txt', '.md', '.kt', '.java'].includes(ext) && stats.size < 500 * 1024) {
-                            const content = fs.readFileSync(fullPath, 'utf-8');
-                            const fenceLang = ext.replace('.', '') || 'plaintext';
-                            // Оборачиваем в Markdown code block, чтобы HTML внутри файла не ломал разметку
-                            fileParts.push(`=== FILE: ${cleanRf} ===\n\`\`\`${fenceLang}\n${content}\n\`\`\`\n`);
-                            this._postActivity(`📖 Прочитан: \`${cleanRf}\``);
-                        } else {
-                            this._postStatus(`☁️ Загрузка ${cleanRf} (${Math.round(stats.size / 1024 / 1024)} МБ)...`);
-                            const fileBuffer = fs.readFileSync(fullPath);
-                            const url = await this._uploadToStorage(chatId, path.basename(cleanRf), fileBuffer);
+                    } else if (att.type === 'file' && att.fsPath) {
+                        if (fs.existsSync(att.fsPath)) {
+                            const buf = fs.readFileSync(att.fsPath);
+                            const url = await this._uploadToStorage(chatId, att.name, buf);
                             if (url) {
-                                fileParts.push(`=== FILE: ${cleanRf} ===\nФайл: ${url}\ncurl -sL "${url}" -o "${cleanRf}"\n`);
-                                this._postActivity(`📖 Передан тяжелый файл: \`${cleanRf}\``);
+                                promptPrefix += `[Прикреплен файл: ${att.name}]\nСсылка: ${url}\nСкачай через: curl -sL "${url}" -o "${att.name}"\n\n`;
                             }
                         }
                     }
                 }
-                currentPrompt = "Вот запрошенные файлы:\n" + fileParts.join("\n");
-                continue;
             }
 
-            let cleanText = text
-                .replace(/\[SYNC:\s*[^\]]+\]/g, "")
-                .replace(/\[DELETE:\s*[^\]]+\]/g, "")
-                .replace(/\[RUN_COMMAND:\s*[^\]]+\]/g, "")
-                .replace(/\[GET_TREE\]/g, "")
-                .replace(/\[GET_FILES:\s*[^\]]+\]/g, "")
-                .trim();
-            const withQuestions = parseAskUser(cleanText);
-            const withMath = renderMath(withQuestions);
-            const htmlContent = marked.parse(withMath);
+            let currentPrompt = promptPrefix ? (promptPrefix + prompt) : prompt;
+            this._postStatus("Агент приступил к работе...");
 
-            this._postToAll({
-                type: 'agent_response',
-                html: htmlContent,
-                rawText: cleanText,
-                chatId: chatId
-            });
-            break;
-        }
+            while (!this._isCancelled) {
+                const task = {
+                    type: "antigravity_task",
+                    prompt: currentPrompt,
+                    chat_id: chatId,
+                    user_token: userAccount.user_token,
+                    workspace_path: targetDir,
+                    ui_msg_id: `vscode_${Date.now()}`
+                };
+
+                const response = await this._sendTask(task);
+                if (this._isCancelled || response?.type === 'antigravity_cancelled') {
+                    this._postActivity("⏹ Задача прервана пользователем");
+                    this._postToAll({ type: 'antigravity_cancelled', chatId: chatId });
+                    break;
+                }
+                if (!response) {
+                    this._postStatus("Сервер не ответил или вернул ошибку.");
+                    this._postToAll({ type: 'antigravity_error', error: "Сбой запроса к AI. Проверьте логи сервера." });
+                    break;
+                }
+                const text = response.text || "";
+
+                if (response.file_urls && Object.keys(response.file_urls).length > 0) {
+                    const existing = this._chatFiles.get(chatId) || {};
+                    const merged = { ...existing, ...response.file_urls };
+                    this._chatFiles.set(chatId, merged);
+
+                    const downloadedMap = this._getDownloadedMap();
+                    for (const rel of Object.keys(response.file_urls)) {
+                        delete downloadedMap[rel.replace(/\\/g, '/')];
+                    }
+                    this._context.workspaceState.update('antigravity_synced_map', downloadedMap);
+                    this._checkAndNotifyUnsynced(chatId);
+                }
+
+                const actionable = getActionableText(text);
+
+                // [DELETE: ...]
+                const deleteMatches = Array.from(actionable.matchAll(/\[DELETE:\s*([^\]]+)\]/g));
+                if (deleteMatches.length > 0 && targetDir && targetDir !== ".") {
+                    for (const match of deleteMatches) {
+                        const relPath = match[1].trim().replace(/\\/g, '/');
+                        const safeRel = path.normalize(relPath).replace(/^(\.\.[\/\\])+/, '');
+                        const fullPath = path.join(targetDir, safeRel);
+
+                        if (fullPath.startsWith(targetDir) && fs.existsSync(fullPath)) {
+                            try {
+                                fs.rmSync(fullPath, { recursive: true, force: true });
+                                this._postActivity(`🗑️ Удален файл проекта: \`${safeRel}\``);
+                            } catch (delErr: any) {
+                                this._postActivity(`⚠️ Ошибка удаления \`${safeRel}\`: ${delErr.message}`);
+                            }
+                        }
+                    }
+                }
+
+                // [RUN_COMMAND: ...]
+                const cmdMatch = actionable.match(/\[RUN_COMMAND:\s*(.*?)\]/);
+                if (cmdMatch) {
+                    const cmd = cmdMatch[1].trim().replace(/^python3\s+/, "python ");
+
+                    if (/^(cmd|powershell|bash|sh|python|node)(\.exe)?\s*$/i.test(cmd)) {
+                        currentPrompt = `Ошибка: Интерактивный запуск '${cmd}' не поддерживается в неинтерактивном режиме. Передавайте конкретную команду с аргументами.`;
+                        this._postActivity(`⚠️ Заблокирован интерактивный запуск: \`${cmd}\``);
+                        continue;
+                    }
+
+                    this._postActivity(`💻 Терминал в '${path.basename(targetDir)}': \`${cmd}\``);
+                    this._postStatus(`⚙️ Выполняется: ${cmd.length > 55 ? cmd.slice(0, 52) + '...' : cmd}`);
+
+                    const finalCmd = process.platform === 'win32' ? `chcp 65001 >nul && ${cmd}` : cmd;
+
+                    const output = await new Promise<string>((resolve) => {
+                        exec(finalCmd, { cwd: targetDir, timeout: 120000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+                            const code = error ? error.code || 1 : 0;
+                            const out = (stdout || "") + "\n" + (stderr || "");
+                            resolve(`Команда \`${cmd}\` завершена (код ${code}).\nЛоги:\n${out.slice(0, 15000)}`);
+                        });
+                    });
+
+                    this._postStatus("🧠 Агент анализирует логи терминала...");
+                    currentPrompt = output;
+                    continue;
+                }
+
+                // [GET_TREE]
+                if (actionable.includes("[GET_TREE]")) {
+                    this._postActivity(`📁 Запрошена структура '${path.basename(targetDir)}' -> передано`);
+                    const tree = this._scanTree(targetDir);
+                    currentPrompt = `Вот структура проекта:\n${tree}`;
+                    continue;
+                }
+
+                // [GET_FILES: ...]
+                const getFilesMatch = actionable.match(/\[GET_FILES:\s*([^\]]+)\]/);
+                if (getFilesMatch) {
+                    const rawFiles = getFilesMatch[1].split(",");
+                    const fileParts: string[] = [];
+
+                    for (const rf of rawFiles) {
+                        const cleanRf = rf.trim().replace(/\\/g, '/');
+                        const fullPath = path.join(targetDir, cleanRf);
+
+                        if (fs.existsSync(fullPath)) {
+                            const ext = path.extname(cleanRf).toLowerCase();
+                            const stats = fs.statSync(fullPath);
+
+                            if (['.py', '.js', '.ts', '.html', '.css', '.json', '.txt', '.md', '.kt', '.java'].includes(ext) && stats.size < 500 * 1024) {
+                                const content = fs.readFileSync(fullPath, 'utf-8');
+                                const fenceLang = ext.replace('.', '') || 'plaintext';
+                                fileParts.push(`=== FILE: ${cleanRf} ===\n\`\`\`${fenceLang}\n${content}\n\`\`\`\n`);
+                                this._postActivity(`📖 Прочитан: \`${cleanRf}\``);
+                            } else {
+                                this._postStatus(`☁️ Загрузка ${cleanRf} (${Math.round(stats.size / 1024 / 1024)} МБ)...`);
+                                const fileBuffer = fs.readFileSync(fullPath);
+                                const url = await this._uploadToStorage(chatId, path.basename(cleanRf), fileBuffer);
+                                if (url) {
+                                    fileParts.push(`=== FILE: ${cleanRf} ===\nФайл: ${url}\ncurl -sL "${url}" -o "${cleanRf}"\n`);
+                                    this._postActivity(`📖 Передан тяжелый файл: \`${cleanRf}\``);
+                                }
+                            }
+                        }
+                    }
+                    currentPrompt = "Вот запрошенные файлы:\n" + fileParts.join("\n");
+                    continue;
+                }
+
+                let cleanText = text
+                    .replace(/\[SYNC:\s*[^\]]+\]/g, "")
+                    .replace(/\[DELETE:\s*[^\]]+\]/g, "")
+                    .replace(/\[RUN_COMMAND:\s*[^\]]+\]/g, "")
+                    .replace(/\[GET_TREE\]/g, "")
+                    .replace(/\[GET_FILES:\s*[^\]]+\]/g, "")
+                    .trim();
+                const withQuestions = parseAskUser(cleanText);
+                const withMath = renderMath(withQuestions);
+                const htmlContent = marked.parse(withMath);
+
+                this._postToAll({
+                    type: 'agent_response',
+                    html: htmlContent,
+                    rawText: cleanText,
+                    chatId: chatId
+                });
+                break;
+            }
         } finally {
             this._isBusy = false;
         }
@@ -609,7 +627,6 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                                 if (m.role === 'agent') {
                                     let raw = m.text || '';
 
-                                    // Проверяем, является ли сообщение агента служебным вызовом команды
                                     const cmdMatch = raw.match(/^\[RUN_COMMAND:\s*([\s\S]*?)\]$/);
                                     const getFilesMatch = raw.match(/^\[GET_FILES:\s*([\s\S]*?)\]$/);
                                     const getTreeMatch = raw.trim() === '[GET_TREE]';
@@ -624,7 +641,6 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                                         m.isActivity = true;
                                         m.html = `<div class="activity-chip">📁 Запрошена структура проекта</div>`;
                                     } else {
-                                        // Обычный ответ агента
                                         let cleanAgentText = raw
                                             .replace(/\[SYNC:\s*[^\]]+\]/g, "")
                                             .replace(/\[DELETE:\s*[^\]]+\]/g, "")
@@ -636,18 +652,15 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                                         m.rawText = cleanAgentText;
                                     }
                                 } else {
-                                    // Сообщение пользователя
                                     let rawUser = m.text || '';
                                     const trimmed = rawUser.trim();
 
-                                    // 1. Проверяем, технический ли это вывод команды или файлов
                                     if (trimmed.startsWith("Команда `") || trimmed.startsWith("Вот запрошенные файлы:") || trimmed.startsWith("Вот структура проекта:")) {
                                         m.isActivity = true;
                                         const firstLine = trimmed.split('\n')[0];
                                         const title = firstLine.length > 70 ? firstLine.slice(0, 67) + '...' : firstLine;
                                         m.html = `<details class="system-log-details"><summary>⚙️ ${escapeHtml(title)}</summary><pre><code>${escapeHtml(rawUser)}</code></pre></details>`;
                                     } else {
-                                        // 2. Реальное сообщение пользователя: извлекаем картинки и ссылки на файлы
                                         const screenshots: string[] = [];
                                         const attachedFiles: Array<{ name: string; url: string }> = [];
 
@@ -657,7 +670,12 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                                         });
 
                                         cleanText = cleanText.replace(/\[Прикреплен файл:\s*([^\]]+)\]\s*Ссылка:\s*(https?:\/\/[^\s]+)(?:\s*Скачай через:[^\n]+)?/g, (_, name, url) => {
-                                            attachedFiles.push({ name, url });
+                                            const ext = path.extname(name).toLowerCase();
+                                            if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'].includes(ext)) {
+                                                screenshots.push(`<br><img src="${url}" alt="${escapeHtml(name)}">`);
+                                            } else {
+                                                attachedFiles.push({ name, url });
+                                            }
                                             return '';
                                         });
 
@@ -693,7 +711,7 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-        private _sendTask(task: any): Promise<any> {
+    private _sendTask(task: any): Promise<any> {
         return new Promise((resolve) => {
             if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
                 return resolve(null);
@@ -701,7 +719,14 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
 
             this._activeUiMsgId = task.ui_msg_id;
 
+            // Ставим 15 минут (900 000 мс) вместо 2.5 минут
+            const timeout = setTimeout(() => {
+                cleanup();
+                this._postStatus("❌ Превышено время ожидания ответа от сервера.");
+                resolve(null);
+            }, 900000);
             const cleanup = () => {
+                clearTimeout(timeout);
                 if (this._ws) {
                     this._ws.off('message', onMessage);
                 }
@@ -728,7 +753,6 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                     const decoded = Buffer.from(raw.toString(), 'base64').toString('utf-8');
                     const json = JSON.parse(decoded);
 
-                    // Строгая фильтрация по ui_msg_id и chat_id для исключения рассинхрона
                     if (json.ui_msg_id && task.ui_msg_id && json.ui_msg_id !== task.ui_msg_id) {
                         return;
                     }
@@ -737,11 +761,11 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                     }
 
                     if (json.type === 'antigravity_status') {
-                        this._postStatus(`Агент думает: ${json.status}...`);
+                        this._postStatus(`Агент: ${json.status || 'обработка'}...`);
                     } else if (json.type === 'antigravity_result' || json.type === 'antigravity_cancelled') {
                         wrappedResolve(json);
                     } else if (json.type === 'antigravity_error') {
-                        this._postStatus(`Ошибка: ${json.error}`);
+                        this._postStatus(`Ошибка агента: ${json.error}`);
                         wrappedResolve(null);
                     }
                 } catch (e) {}
@@ -839,7 +863,8 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
   .attachment-chip img { max-height: 22px; border-radius: 2px; }
   .attachment-chip .remove-btn { cursor: pointer; font-weight: bold; margin-left: 2px; color: #f85149; }
 
-  .input-area { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; flex-shrink: 0; }
+  .input-area { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; flex-shrink: 0; border: 1px dashed transparent; border-radius: 4px; transition: border-color 0.2s; }
+  .input-area.dragover { border-color: #007acc; }
   
   textarea { background: var(--vscode-input-background, #0d1117); color: var(--vscode-input-foreground, #c9d1d9); border: 1px solid var(--vscode-input-border, #30363d); resize: vertical; min-height: 60px; max-height: 250px; height: 75px; padding: 7px; font-family: inherit; font-size: 13px; border-radius: 4px; }
   textarea:focus { outline: 1px solid #007acc; border-color: #007acc; }
@@ -868,9 +893,9 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
     <span id="status-bar" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></span>
   </div>
 
-  <div class="input-area">
+  <div class="input-area" id="input-area-box">
     <div id="attachments-bar"></div>
-    <textarea id="prompt-input" placeholder="Задача или вопрос... (Enter отправка, Shift+Enter перенос)"></textarea>
+    <textarea id="prompt-input" placeholder="Задача или вопрос... (Enter отправка, Shift+Enter перенос, Ctrl+V вставка картинок)"></textarea>
     <div class="btn-row">
       <button id="attach-file-btn">📎 Файл</button>
       <button id="cancel-btn" style="display:none;">⏹ Отмена</button>
@@ -886,6 +911,7 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
   let currentAttachments = [];
   let timerInterval = null;
   let timerSeconds = 0;
+  let isReadingFiles = false;
 
   function startTimer() {
     timerSeconds = 0;
@@ -972,24 +998,105 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
     }
   }, true);
 
-  document.addEventListener('paste', (e) => {
+  // Пакетная синхронная загрузка фото из буфера обмена (решает баг потери картинок!)
+  document.addEventListener('paste', async (e) => {
     const items = (e.clipboardData || window.clipboardData)?.items;
     if (!items) return;
+
+    const imageBlobs = [];
     for (let i = 0; i < items.length; i++) {
       if (items[i].type.indexOf('image') !== -1) {
-        e.preventDefault();
-        e.stopPropagation();
         const blob = items[i].getAsFile();
+        if (blob) imageBlobs.push(blob);
+      }
+    }
+
+    if (imageBlobs.length === 0) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    isReadingFiles = true;
+    document.getElementById('status-bar').textContent = 'Чтение ' + imageBlobs.length + ' фото из буфера...';
+
+    const timestamp = Date.now();
+    const readPromises = imageBlobs.map((blob, idx) => {
+      return new Promise((resolve) => {
         const reader = new FileReader();
         reader.onload = (event) => {
           const dataUrl = event.target.result;
           const base64 = dataUrl.split(',')[1];
-          const name = 'screenshot_' + Date.now() + '.png';
-          currentAttachments.push({ type: 'screenshot', name, dataUrl, base64 });
-          renderAttachments();
+          const rand = Math.random().toString(36).slice(2, 6);
+          const name = 'screenshot_' + timestamp + '_' + (idx + 1) + '_' + rand + '.png';
+          resolve({ type: 'screenshot', name, dataUrl, base64 });
         };
         reader.readAsDataURL(blob);
-      }
+      });
+    });
+
+    try {
+      const newPhotos = await Promise.all(readPromises);
+      currentAttachments.push(...newPhotos);
+      renderAttachments();
+      document.getElementById('status-bar').textContent = 'Прикреплено фото: ' + newPhotos.length + ' шт.';
+      setTimeout(() => {
+        if (!timerInterval) document.getElementById('status-bar').textContent = '';
+      }, 2500);
+    } finally {
+      isReadingFiles = false;
+    }
+  });
+
+  // Drag & drop картинок прямо в поле ввода
+  const dropBox = document.getElementById('input-area-box');
+  ['dragenter', 'dragover'].forEach(evt => {
+    dropBox.addEventListener(evt, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropBox.classList.add('dragover');
+    }, false);
+  });
+  ['dragleave', 'drop'].forEach(evt => {
+    dropBox.addEventListener(evt, (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropBox.classList.remove('dragover');
+    }, false);
+  });
+  dropBox.addEventListener('drop', async (e) => {
+    const files = e.dataTransfer?.files;
+    if (!files || files.length === 0) return;
+
+    const imgFiles = Array.from(files).filter(f => f.type.startsWith('image/'));
+    if (imgFiles.length === 0) return;
+
+    isReadingFiles = true;
+    document.getElementById('status-bar').textContent = 'Чтение ' + imgFiles.length + ' файлов...';
+    const timestamp = Date.now();
+    const readPromises = imgFiles.map((f, idx) => {
+      return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const dataUrl = ev.target.result;
+          const base64 = dataUrl.split(',')[1];
+          const rand = Math.random().toString(36).slice(2, 6);
+          const name = f.name || ('drop_' + timestamp + '_' + (idx + 1) + '_' + rand + '.png');
+          resolve({ type: 'screenshot', name, dataUrl, base64 });
+        };
+        reader.readAsDataURL(f);
+      });
+    });
+
+    try {
+      const newLoaded = await Promise.all(readPromises);
+      currentAttachments.push(...newLoaded);
+      renderAttachments();
+      document.getElementById('status-bar').textContent = 'Добавлено ' + newLoaded.length + ' фото';
+      setTimeout(() => {
+        if (!timerInterval) document.getElementById('status-bar').textContent = '';
+      }, 2500);
+    } finally {
+      isReadingFiles = false;
     }
   });
 
@@ -999,8 +1106,8 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
     currentAttachments.forEach((att, idx) => {
       const chip = document.createElement('div');
       chip.className = 'attachment-chip';
-      if (att.type === 'screenshot') {
-        chip.innerHTML = '<img src="' + att.dataUrl + '"> <span>' + att.name + '</span>';
+      if (att.type === 'screenshot' && att.dataUrl) {
+        chip.innerHTML = '<img src="' + att.dataUrl + '"> <span>' + escapeHtml(att.name) + '</span>';
       } else {
         const sizeStr = att.size ? ' (' + Math.round(att.size / 1024) + ' КБ)' : '';
         chip.innerHTML = '<span>📄 ' + escapeHtml(att.name) + sizeStr + '</span>';
@@ -1134,6 +1241,10 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
   };
 
   function send() {
+    if (isReadingFiles) {
+      document.getElementById('status-bar').textContent = 'Подождите, фото еще загружаются...';
+      return;
+    }
     const input = document.getElementById('prompt-input');
     const text = input.value.trim();
     if (!text && currentAttachments.length === 0) return;
@@ -1144,10 +1255,14 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
       renderSelect();
     }
 
+    // Сохраняем и очищаем вложения СРАЗУ В МОМЕНТ ОТПРАВКИ
+    const payloadAttachments = [...currentAttachments];
+    currentAttachments = [];
+
     let displayHtml = escapeHtml(text).replace(/\\n/g, '<br>');
-    if (currentAttachments.length > 0) {
-      const imgsHtml = currentAttachments.map(a => {
-        if (a.type === 'screenshot') {
+    if (payloadAttachments.length > 0) {
+      const imgsHtml = payloadAttachments.map(a => {
+        if (a.type === 'screenshot' && a.dataUrl) {
           return '<br><img src="' + a.dataUrl + '">';
         } else {
           return '<br><span>📄 ' + escapeHtml(a.name) + '</span>';
@@ -1158,9 +1273,6 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
 
     appendMessageUI('user', displayHtml, true);
     input.value = '';
-
-    const payloadAttachments = [...currentAttachments];
-    currentAttachments = [];
     renderAttachments();
 
     startTimer();
@@ -1193,6 +1305,10 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
         fsPath: msg.file.fsPath,
         size: msg.file.size
       });
+      renderAttachments();
+    }
+    else if (msg.type === 'files_attached_batch') {
+      currentAttachments.push(...msg.files);
       renderAttachments();
     }
     else if (msg.type === 'antigravity_chats_list') {
