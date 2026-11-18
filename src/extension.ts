@@ -719,14 +719,18 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
 
             this._activeUiMsgId = task.ui_msg_id;
 
-            // Ставим 15 минут (900 000 мс) вместо 2.5 минут
-            const timeout = setTimeout(() => {
-                cleanup();
-                this._postStatus("❌ Превышено время ожидания ответа от сервера.");
-                resolve(null);
-            }, 900000);
+            let timeout: NodeJS.Timeout | undefined;
+            const resetTimeout = () => {
+                if (timeout) { clearTimeout(timeout); }
+                timeout = setTimeout(() => {
+                    cleanup();
+                    this._postStatus("❌ Сервер перестал отвечать (нет статуса > 5 минут).");
+                    resolve(null);
+                }, 300000); // 5 минут полной тишины от сервера
+            };
+
             const cleanup = () => {
-                clearTimeout(timeout);
+                if (timeout) { clearTimeout(timeout); }
                 if (this._ws) {
                     this._ws.off('message', onMessage);
                 }
@@ -746,6 +750,8 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
             this._activeTaskResolver = wrappedResolve;
             this._activeTaskCleanup = cleanup;
 
+            resetTimeout();
+
             const encoded = Buffer.from(JSON.stringify(task)).toString('base64');
 
             const onMessage = (raw: any) => {
@@ -761,6 +767,7 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
                     }
 
                     if (json.type === 'antigravity_status') {
+                        resetTimeout(); // Сервер жив — сбрасываем таймер!
                         this._postStatus(`Агент: ${json.status || 'обработка'}...`);
                     } else if (json.type === 'antigravity_result' || json.type === 'antigravity_cancelled') {
                         wrappedResolve(json);
@@ -775,7 +782,6 @@ class AntigravityViewProvider implements vscode.WebviewViewProvider {
             this._ws.send(encoded);
         });
     }
-
     private _postStatus(status: string) {
         this._postToAll({ type: 'status_update', status });
     }
